@@ -1,0 +1,92 @@
+# [Required]
+# Possible values for the Catalog item that can be deployed on a DataMiner System:
+#   - Automation: If the Catalog item is a general-purpose DataMiner Automation script.
+#   - Ad Hoc Data Source: If the Catalog item is a DataMiner Automation script designed for an ad hoc data source integration.
+#   - ChatOps Extension: If the Catalog item is a DataMiner Automation script designed as a ChatOps extension.
+#   - Connector: If the Catalog item is a DataMiner XML connector.
+#   - Custom Solution: If the Catalog item is a DataMiner Solution.
+#   - Data Transformer: Includes a data transformer that enables you to modify data using a GQI data query before making it available to users in low-code apps or dashboards.
+#   - Dashboard: If the Catalog item is a DataMiner dashboard.
+#   - DevTool: If the Catalog item is a DevTool.
+#   - Learning & Sample: If the Catalog item is a sample.
+#   - Product Solution: If the Catalog item is a DataMiner Solution that is an out-of-the-box solution for a specific product.
+#   - Scripted Connector: If the Catalog item is a DataMiner scripted connector.
+#   - Standard Solution: If the Catalog item is a DataMiner Solution that is an out-of-the-box solution for a specific use case or application.
+#   - System Health: If the Catalog item is intended to monitor the health of a system.
+#   - User-Defined API: If the Catalog item is a DataMiner Automation script designed as a user-defined API.
+#   - Visual Overview: If the Catalog item is a Microsoft Visio design.
+type: Custom Solution
+
+# [Required] 
+# The ID of the Catalog item.
+# All registered versions for the same ID are shown together in the Catalog.
+# This ID cannot be changed. 
+# If the ID is not filled in, the registration will fail with HTTP status code 500. 
+# If the ID is filled in but does not exist yet, a new Catalog item will be registered with this ID.
+# If the ID is filled in but does exist, properties of the item will be overwritten.
+#   Must be a valid GUID.
+id: 50d7dd3e-7c04-4b25-8108-03c772fbd80d
+
+# [Required] 
+# The human-friendly name of the Catalog item. 
+# Can be changed at any time.
+#   Max length: 100 characters.
+#   Cannot contain newlines.
+#   Cannot contain leading or trailing whitespace characters.
+title: TLRBMT-AS-Alarm List Duration
+
+# [Optional]
+# General information about the Catalog item.
+#   Max length: 100,000 characters
+# Currently not shown in the Catalog UI but will be supported in the near future.
+short_description: 
+
+# [Optional]
+# A valid URL that points to the source code.
+#   A valid URL
+#   Max length: 2048 characters
+source_code_url: 
+
+# [Optional]
+# A valid URL that points to documentation.
+#   A valid URL
+#   Max length: 2048 characters
+# Currently not shown in the Catalog UI but will be supported in the near future.
+documentation_url: 
+
+# [Optional]
+# People who are responsible for this Catalog item. Might be developers, but this is not required.
+#   The name is required; max 256 characters.
+#   The email and url are optional, and should be in valid email/URL formats.
+owners:
+  - name: 'Stacey Van Colen'
+    email: 
+    url: 
+
+# [Optional]
+# Tags that allow you to categorize your Catalog items.
+#   Max number of tags: 5
+#   Max length: 50 characters.
+#   Cannot contain newlines.
+#   Cannot contain leading or trailing whitespace characters.
+tags:
+  - 
+
+# [Optional]
+# The ID of the vendor.
+# This vendor ID can be retrieved using the public Catalog API.
+# If the vendor ID does not exist, the registration or update will fail with HTTP status code 400. 
+# If the vendor ID is '00000000-0000-0000-0000-000000000000', the vendor will be unset. 
+# If the vendor ID is not provided during the initial registration, the vendor will be unset.
+# If the vendor ID is not provided during an update, the vendor will be unchanged and keep the previously set value.
+#   Must be a valid GUID.
+vendor_id: 
+
+# [Optional]
+# The name of the market the Catalog item belongs to.
+market_name: 
+
+# [Optional]
+# The type of the element.
+# This can only be applied to Catalog items with the type Connector.
+element_type: 

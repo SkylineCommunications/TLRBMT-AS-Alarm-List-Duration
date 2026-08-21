@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<DMSScript options="272" xmlns="http://www.skyline.be/automation">
+	<Name>TLRBMT-AS-Alarm List Duration</Name>
+	<Description></Description>
+	<Type>Automation</Type>
+	<Author>Stacey Van Colen</Author>
+	<CheckSets>FALSE</CheckSets>
+	<Folder></Folder>
+
+	<Protocols>
+	</Protocols>
+
+	<Memory>
+	</Memory>
+
+	<Parameters>
+	</Parameters>
+
+	<Script>
+		<Exe id="1" type="csharp">
+			<Value><![CDATA[[Project:TLRBMT-AS-Alarm List Duration]]]></Value>
+			<!--<Param type="debug">true</Param>-->
+			<Param type="preCompile">true</Param>
+			<Param type="libraryName">TLRBMTASAlarmListDuration</Param>
+			<Message></Message>
+		</Exe>
+	</Script>
+</DMSScript>
