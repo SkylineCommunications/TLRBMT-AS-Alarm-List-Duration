@@ -168,65 +168,72 @@ namespace TLRBMTASAlarmListDuration
                 }
             }
 
-            // Process each root alarm tree to find ON/OFF pairs
+            // Process each root alarm tree to find severity transitions
             foreach (var kvp in alarmsByRootId)
             {
                 // Sort alarms by TimeOfArrival
                 var sortedAlarms = kvp.Value.OrderBy(a => a.TimeOfArrival).ToList();
 
-                // Find ON/OFF pairs
-                AlarmEventMessage currentOnAlarm = null;
+                // Track the current alarm state
+                AlarmEventMessage currentAlarm = null;
 
                 foreach (var alarm in sortedAlarms)
                 {
                     bool isNormal = string.Equals(alarm.Severity, "Normal", StringComparison.OrdinalIgnoreCase);
 
-                    if (!isNormal && currentOnAlarm == null)
+                    if (currentAlarm == null)
                     {
-                        // This is an Alarm ON event
-                        currentOnAlarm = alarm;
+                        // First alarm in sequence - start tracking if not Normal
+                        if (!isNormal)
+                        {
+                            currentAlarm = alarm;
+                        }
                     }
-                    else if (isNormal && currentOnAlarm != null)
+                    else
                     {
-                        // This is an Alarm OFF event - create a row with duration
-                        var alarmOnUtc = DateTime.SpecifyKind(currentOnAlarm.TimeOfArrival, DateTimeKind.Utc);
-                        var alarmOffUtc = DateTime.SpecifyKind(alarm.TimeOfArrival, DateTimeKind.Utc);
-                        var duration = alarmOffUtc - alarmOnUtc;
+                        // Check if severity changed from current
+                        bool severityChanged = !string.Equals(alarm.Severity, currentAlarm.Severity, StringComparison.OrdinalIgnoreCase);
 
-                        var row = new GQIRow(
-                            new GQICell[]
-                            {
-                                new GQICell { Value = currentOnAlarm.ElementName },
-                                new GQICell { Value = currentOnAlarm.ParameterName },
-                                new GQICell { Value = currentOnAlarm.Severity },
-                                new GQICell { Value = alarmOnUtc },
-                                new GQICell { Value = alarmOffUtc },
-                                new GQICell { Value = FormatDuration(duration) },
-                            });
+                        if (severityChanged)
+                        {
+                            // Create a row for the duration of the previous severity
+                            var alarmOnUtc = DateTime.SpecifyKind(currentAlarm.TimeOfArrival, DateTimeKind.Utc);
+                            var alarmOffUtc = DateTime.SpecifyKind(alarm.TimeOfArrival, DateTimeKind.Utc);
+                            var duration = alarmOffUtc - alarmOnUtc;
 
-                        rows.Add(row);
+                            var row = new GQIRow(
+                                new GQICell[]
+                                {
+                                    new GQICell { Value = currentAlarm.ElementName },
+                                    new GQICell { Value = currentAlarm.ParameterName },
+                                    new GQICell { Value = currentAlarm.Severity },
+                                    new GQICell { Value = alarmOnUtc },
+                                    new GQICell { Value = alarmOffUtc },
+                                    new GQICell { Value = FormatDuration(duration) },
+                                });
 
-                        // Reset for next potential ON alarm in the same tree
-                        currentOnAlarm = null;
-                    }
-                    else if (!isNormal && currentOnAlarm != null)
-                    {
-                        // Severity changed but not to Normal (e.g., Warning -> Critical)
-                        // Keep the original ON alarm, don't create a new row yet
+                            rows.Add(row);
+
+                            // If the new severity is Normal, we're done with this alarm tree
+                            // Otherwise, start tracking the new severity
+                            currentAlarm = isNormal ? null : alarm;
+                        }
+
+                        // If severity didn't change, this is an update to the same alarm - continue tracking
                     }
                 }
 
-                // Handle case where alarm is still ON (no OFF found within the time range)
-                if (currentOnAlarm != null)
+                // Handle case where alarm is still active (didn't end with Normal within the time range)
+                if (currentAlarm != null)
                 {
-                    var alarmOnUtc = DateTime.SpecifyKind(currentOnAlarm.TimeOfArrival, DateTimeKind.Utc);
+                    var alarmOnUtc = DateTime.SpecifyKind(currentAlarm.TimeOfArrival, DateTimeKind.Utc);
 
                     var row = new GQIRow(
                         new GQICell[]
                         {
-                            new GQICell { Value = currentOnAlarm.ElementName },
-                            new GQICell { Value = currentOnAlarm.ParameterName },
-                            new GQICell { Value = currentOnAlarm.Severity },
+                            new GQICell { Value = currentAlarm.ElementName },
+                            new GQICell { Value = currentAlarm.ParameterName },
+                            new GQICell { Value = currentAlarm.Severity },
                             new GQICell { Value = alarmOnUtc },
                             new GQICell { Value = null }, // Still active, no OFF time
                             new GQICell { Value = "Active" },
@@ -244,22 +251,9 @@ namespace TLRBMTASAlarmListDuration
 
         private static string FormatDuration(TimeSpan duration)
         {
-            if (duration.TotalDays >= 1)
-            {
-                return $"{(int)duration.TotalDays}d {duration.Hours}h {duration.Minutes}m {duration.Seconds}s";
-            }
-            else if (duration.TotalHours >= 1)
-            {
-                return $"{(int)duration.TotalHours}h {duration.Minutes}m {duration.Seconds}s";
-            }
-            else if (duration.TotalMinutes >= 1)
-            {
-                return $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
-            }
-            else
-            {
-                return $"{duration.Seconds}s";
-            }
+            // Format as HH:MM:SS (supports durations longer than 24 hours)
+            int totalHours = (int)duration.TotalHours;
+            return $"{totalHours:D2}:{duration.Minutes:D2}:{duration.Seconds:D2}";
         }
 
         /// <summary>
