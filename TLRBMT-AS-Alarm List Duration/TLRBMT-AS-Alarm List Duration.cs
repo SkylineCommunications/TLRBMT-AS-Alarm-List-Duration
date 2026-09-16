@@ -22,7 +22,7 @@ namespace TLRBMTASAlarmListDuration
         private readonly GQIStringColumn _severityColumn = new GQIStringColumn("Severity");
         private readonly GQIDateTimeColumn _alarmOnColumn = new GQIDateTimeColumn("Alarm On");
         private readonly GQIDateTimeColumn _alarmOffColumn = new GQIDateTimeColumn("Alarm Off");
-        private readonly GQIStringColumn _durationColumn = new GQIStringColumn("Duration");
+        private readonly GQIDoubleColumn _durationColumn = new GQIDoubleColumn("Duration (s)");
 
         // Input argument definitions
         private readonly GQIStringArgument _elementNameArg = new GQIStringArgument("Element name") { IsRequired = true };
@@ -30,6 +30,7 @@ namespace TLRBMTASAlarmListDuration
         private readonly GQIStringArgument _selectSeveritiesArg = new GQIStringArgument("Select severities") { IsRequired = true };
         private readonly GQIDateTimeArgument _dateFromArg = new GQIDateTimeArgument("Date from") { IsRequired = true };
         private readonly GQIDateTimeArgument _dateToArg = new GQIDateTimeArgument("Date to") { IsRequired = true };
+        private readonly GQIBooleanArgument _provideResultArg = new GQIBooleanArgument("Provide Result") { IsRequired = true };
 
         // GQIDMS connection
         private GQIDMS _dms;
@@ -40,6 +41,7 @@ namespace TLRBMTASAlarmListDuration
         private string _selectSeverities;
         private DateTime _dateFrom;
         private DateTime _dateTo;
+        private bool _provideResult;
 
         /// <inheritdoc />
         public OnInitOutputArgs OnInit(OnInitInputArgs args)
@@ -58,6 +60,7 @@ namespace TLRBMTASAlarmListDuration
                 _selectSeveritiesArg,
                 _dateFromArg,
                 _dateToArg,
+                _provideResultArg,
             };
         }
 
@@ -69,6 +72,7 @@ namespace TLRBMTASAlarmListDuration
             _selectSeverities = args.GetArgumentValue(_selectSeveritiesArg);
             _dateFrom = args.GetArgumentValue(_dateFromArg);
             _dateTo = args.GetArgumentValue(_dateToArg);
+            _provideResult = args.GetArgumentValue(_provideResultArg);
 
             return default;
         }
@@ -91,6 +95,28 @@ namespace TLRBMTASAlarmListDuration
         public GQIPage GetNextPage(GetNextPageInputArgs args)
         {
             var rows = new List<GQIRow>();
+
+            // Skip the full search and return a quick prompt row when result generation is disabled
+            if (!_provideResult)
+            {
+                var promptRow = new GQIRow(
+                    new GQICell[]
+                    {
+                        new GQICell { Value = "Enable 'Provide Result' to run the search." },
+                        new GQICell { Value = string.Empty },
+                        new GQICell { Value = string.Empty },
+                        new GQICell { Value = null },
+                        new GQICell { Value = null },
+                        new GQICell { Value = null },
+                    });
+
+                rows.Add(promptRow);
+
+                return new GQIPage(rows.ToArray())
+                {
+                    HasNextPage = false,
+                };
+            }
 
             // Ensure dates are in UTC
             var startTimeUtc = _dateFrom.Kind == DateTimeKind.Utc ? _dateFrom : DateTime.SpecifyKind(_dateFrom, DateTimeKind.Utc);
@@ -136,6 +162,9 @@ namespace TLRBMTASAlarmListDuration
 
             var responses = _dms.SendMessages(alarmMessage);
 
+            // Precompile the parameter-name wildcard pattern once instead of per alarm
+            var parameterRegex = BuildWildcardRegex(_parameterName);
+
             // Collect all matching alarms and group by Root Alarm ID
             var alarmsByRootId = new Dictionary<string, List<AlarmEventMessage>>();
 
@@ -144,7 +173,7 @@ namespace TLRBMTASAlarmListDuration
                 if (response is AlarmEventMessage alarm)
                 {
                     // Filter by parameter name using wildcard matching
-                    if (!MatchesWildcard(alarm.ParameterName, _parameterName))
+                    if (!MatchesWildcard(alarm.ParameterName, parameterRegex))
                     {
                         continue;
                     }
@@ -159,20 +188,22 @@ namespace TLRBMTASAlarmListDuration
                     // Using TreeID which identifies the alarm tree
                     var rootKey = $"{alarm.DataMinerID}/{alarm.TreeID}";
 
-                    if (!alarmsByRootId.ContainsKey(rootKey))
+                    if (!alarmsByRootId.TryGetValue(rootKey, out var alarmsForRoot))
                     {
-                        alarmsByRootId[rootKey] = new List<AlarmEventMessage>();
+                        alarmsForRoot = new List<AlarmEventMessage>();
+                        alarmsByRootId[rootKey] = alarmsForRoot;
                     }
 
-                    alarmsByRootId[rootKey].Add(alarm);
+                    alarmsForRoot.Add(alarm);
                 }
             }
 
             // Process each root alarm tree to find ON/OFF pairs
             foreach (var kvp in alarmsByRootId)
             {
-                // Sort alarms by TimeOfArrival
-                var sortedAlarms = kvp.Value.OrderBy(a => a.TimeOfArrival).ToList();
+                // Sort alarms by TimeOfArrival in place (avoids LINQ overhead)
+                var sortedAlarms = kvp.Value;
+                sortedAlarms.Sort((a, b) => a.TimeOfArrival.CompareTo(b.TimeOfArrival));
 
                 // Find ON/OFF pairs
                 AlarmEventMessage currentOnAlarm = null;
@@ -201,7 +232,7 @@ namespace TLRBMTASAlarmListDuration
                                 new GQICell { Value = currentOnAlarm.Severity },
                                 new GQICell { Value = alarmOnUtc },
                                 new GQICell { Value = alarmOffUtc },
-                                new GQICell { Value = FormatDuration(duration) },
+                                new GQICell { Value = duration.TotalSeconds },
                             });
 
                         rows.Add(row);
@@ -229,7 +260,7 @@ namespace TLRBMTASAlarmListDuration
                             new GQICell { Value = currentOnAlarm.Severity },
                             new GQICell { Value = alarmOnUtc },
                             new GQICell { Value = null }, // Still active, no OFF time
-                            new GQICell { Value = "Active" },
+                            new GQICell { Value = null }, // Active alarm, duration not yet known
                         });
 
                     rows.Add(row);
@@ -242,49 +273,39 @@ namespace TLRBMTASAlarmListDuration
             };
         }
 
-        private static string FormatDuration(TimeSpan duration)
+
+
+        /// <summary>
+        /// Builds a compiled regex for a wildcard pattern (* and ?), or null when the pattern matches everything.
+        /// </summary>
+        private static System.Text.RegularExpressions.Regex BuildWildcardRegex(string pattern)
         {
-            if (duration.TotalDays >= 1)
+            if (string.IsNullOrEmpty(pattern) || pattern == "*")
             {
-                return $"{(int)duration.TotalDays}d {duration.Hours}h {duration.Minutes}m {duration.Seconds}s";
+                return null;
             }
-            else if (duration.TotalHours >= 1)
-            {
-                return $"{(int)duration.TotalHours}h {duration.Minutes}m {duration.Seconds}s";
-            }
-            else if (duration.TotalMinutes >= 1)
-            {
-                return $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
-            }
-            else
-            {
-                return $"{duration.Seconds}s";
-            }
+
+            // Escape special regex characters, then convert * and ? to regex equivalents
+            var regexPattern = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
+                .Replace("\\*", ".*")
+                .Replace("\\?", ".") + "$";
+
+            return new System.Text.RegularExpressions.Regex(
+                regexPattern,
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
         }
 
         /// <summary>
-        /// Matches a value against a wildcard pattern.
-        /// Supports * (matches any characters) and ? (matches single character).
+        /// Matches a value against a precompiled wildcard regex. A null regex means "match everything".
         /// </summary>
-        private static bool MatchesWildcard(string value, string pattern)
+        private static bool MatchesWildcard(string value, System.Text.RegularExpressions.Regex pattern)
         {
             if (string.IsNullOrEmpty(value))
             {
                 return false;
             }
 
-            if (string.IsNullOrEmpty(pattern) || pattern == "*")
-            {
-                return true;
-            }
-
-            // Convert wildcard pattern to regex
-            // Escape special regex characters, then convert * and ? to regex equivalents
-            var regexPattern = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
-                .Replace("\\*", ".*")
-                .Replace("\\?", ".") + "$";
-
-            return System.Text.RegularExpressions.Regex.IsMatch(value, regexPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return pattern == null || pattern.IsMatch(value);
         }
     }
 }
