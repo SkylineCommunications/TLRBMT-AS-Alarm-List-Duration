@@ -3,6 +3,7 @@ using Skyline.DataMiner.Net.Filters;
 using Skyline.DataMiner.Net.Messages;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 namespace TLRBMTASAlarmListDuration
@@ -137,8 +138,8 @@ namespace TLRBMTASAlarmListDuration
             // Create set for fast lookup (case-insensitive)
             var severitySet = new HashSet<string>(severities, StringComparer.OrdinalIgnoreCase);
 
-            // Create alarm filter - use wildcard pattern for element name at API level
-            // Parameter name and severity filtering is done in code
+            // Apply element and parameter wildcards in the DataMiner query.
+            // Severity filtering remains in code because Normal is included to find alarm OFF events.
             var filter = new AlarmFilter
             {
                 FilterItems = new AlarmFilterItem[]
@@ -147,6 +148,10 @@ namespace TLRBMTASAlarmListDuration
                         AlarmFilterField.ElementID,
                         AlarmFilterCompareType.WildcardEquality,
                         new string[] { _elementName }),
+                    new AlarmFilterItemString(
+                        AlarmFilterField.ParameterDescription,
+                        AlarmFilterCompareType.WildcardEquality,
+                        new string[] { _parameterName }),
                 },
             };
 
@@ -160,18 +165,23 @@ namespace TLRBMTASAlarmListDuration
                 true,
                 false);
 
+            var queryStopwatch = Stopwatch.StartNew();
             var responses = _dms.SendMessages(alarmMessage);
+            queryStopwatch.Stop();
 
             // Precompile the parameter-name wildcard pattern once instead of per alarm
             var parameterRegex = BuildWildcardRegex(_parameterName);
 
             // Collect all matching alarms and group by Root Alarm ID
             var alarmsByRootId = new Dictionary<string, List<AlarmEventMessage>>();
+            var initialQueryAlarmCount = 0;
 
             foreach (var response in responses)
             {
                 if (response is AlarmEventMessage alarm)
                 {
+                    initialQueryAlarmCount++;
+
                     // Filter by parameter name using wildcard matching
                     if (!MatchesWildcard(alarm.ParameterName, parameterRegex))
                     {
@@ -197,6 +207,17 @@ namespace TLRBMTASAlarmListDuration
                     alarmsForRoot.Add(alarm);
                 }
             }
+
+            rows.Add(new GQIRow(
+                new GQICell[]
+                {
+                    new GQICell { Value = $"Initial query returned {initialQueryAlarmCount} alarm events in {queryStopwatch.Elapsed.TotalSeconds:F2} seconds." },
+                    new GQICell { Value = string.Empty },
+                    new GQICell { Value = string.Empty },
+                    new GQICell { Value = null },
+                    new GQICell { Value = null },
+                    new GQICell { Value = null },
+                }));
 
             // Process each root alarm tree to find ON/OFF pairs
             foreach (var kvp in alarmsByRootId)
