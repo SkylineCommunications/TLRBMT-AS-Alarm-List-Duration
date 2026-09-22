@@ -119,9 +119,10 @@ namespace TLRBMTASAlarmListDuration
                 };
             }
 
-            // Ensure dates are in UTC
-            var startTimeUtc = _dateFrom.Kind == DateTimeKind.Utc ? _dateFrom : DateTime.SpecifyKind(_dateFrom, DateTimeKind.Utc);
-            var endTimeUtc = _dateTo.Kind == DateTimeKind.Utc ? _dateTo : DateTime.SpecifyKind(_dateTo, DateTimeKind.Utc);
+            // The GQI argument is tagged as UTC even though its clock value represents local user time.
+            // Remove that tag before converting the local wall-clock values to UTC for the query.
+            var startTimeUtc = DateTime.SpecifyKind(_dateFrom, DateTimeKind.Unspecified).ToUniversalTime();
+            var endTimeUtc = DateTime.SpecifyKind(_dateTo, DateTimeKind.Unspecified).ToUniversalTime();
 
             // Parse severities from input (comma-separated) and always include Normal for OFF detection
             var severities = _selectSeverities
