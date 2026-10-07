@@ -119,10 +119,8 @@ namespace TLRBMTASAlarmListDuration
                 };
             }
 
-            // The GQI argument is tagged as UTC even though its clock value represents local user time.
-            // Remove that tag before converting the local wall-clock values to UTC for the query.
-            var startTimeUtc = DateTime.SpecifyKind(_dateFrom, DateTimeKind.Unspecified).ToUniversalTime();
-            var endTimeUtc = DateTime.SpecifyKind(_dateTo, DateTimeKind.Unspecified).ToUniversalTime();
+            var startTimeUtc = _dateFrom.ToUniversalTime();
+            var endTimeUtc = _dateTo.ToUniversalTime();
 
             // Parse severities from input (comma-separated) and always include Normal for OFF detection
             var severities = _selectSeverities
@@ -242,8 +240,8 @@ namespace TLRBMTASAlarmListDuration
                     else if (isNormal && currentOnAlarm != null)
                     {
                         // This is an Alarm OFF event - create a row with duration
-                        var alarmOnUtc = DateTime.SpecifyKind(currentOnAlarm.TimeOfArrival, DateTimeKind.Utc);
-                        var alarmOffUtc = DateTime.SpecifyKind(alarm.TimeOfArrival, DateTimeKind.Utc);
+                        var alarmOnUtc = currentOnAlarm.TimeOfArrival.ToUniversalTime();
+                        var alarmOffUtc = alarm.TimeOfArrival.ToUniversalTime();
                         var duration = alarmOffUtc - alarmOnUtc;
 
                         var row = new GQIRow(
@@ -272,7 +270,7 @@ namespace TLRBMTASAlarmListDuration
                 // Handle case where alarm is still ON (no OFF found within the time range)
                 if (currentOnAlarm != null)
                 {
-                    var alarmOnUtc = DateTime.SpecifyKind(currentOnAlarm.TimeOfArrival, DateTimeKind.Utc);
+                    var alarmOnUtc = currentOnAlarm.TimeOfArrival.ToUniversalTime();
 
                     var row = new GQIRow(
                         new GQICell[]
