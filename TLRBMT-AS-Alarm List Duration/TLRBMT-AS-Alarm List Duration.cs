@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace TLRBMTASAlarmListDuration
 {
@@ -44,6 +45,29 @@ namespace TLRBMTASAlarmListDuration
         private DateTime _dateTo;
         private bool _provideResult;
 
+        // Paging state: the search walks the range one window per page
+        private static readonly TimeSpan WindowSize = TimeSpan.FromDays(1);
+        private DateTime? _windowStart;
+        private DateTime _endUtc;
+        private HashSet<string> _severitySet;
+        private System.Text.RegularExpressions.Regex _parameterRegex;
+        private readonly Dictionary<string, AlarmEventMessage> _openAlarms = new Dictionary<string, AlarmEventMessage>();
+        private readonly HashSet<string> _seenEvents = new HashSet<string>();
+        private int _returnedEventCount;
+        private readonly Stopwatch _searchStopwatch = new Stopwatch();
+        private const int ParallelQueries = 5;
+
+        // Stay below the ~5 minute GQI timeout so partial results are returned instead of an error
+        private static readonly TimeSpan SearchTimeBudget = TimeSpan.FromMinutes(4);
+        private int _windowCount;
+        private TimeSpan _slowestWindow;
+        private DateTime _slowestWindowStart;
+
+        // Null means no element filter; otherwise "dmaID/elementID" keys for the DB query
+        private string[] _elementIds;
+        private DateTime _nextQueryStart;
+        private readonly Queue<Tuple<DateTime, Task<WindowResult>>> _pending = new Queue<Tuple<DateTime, Task<WindowResult>>>();
+
         /// <inheritdoc />
         public OnInitOutputArgs OnInit(OnInitInputArgs args)
         {
@@ -74,6 +98,7 @@ namespace TLRBMTASAlarmListDuration
             _dateFrom = args.GetArgumentValue(_dateFromArg);
             _dateTo = args.GetArgumentValue(_dateToArg);
             _provideResult = args.GetArgumentValue(_provideResultArg);
+            _windowStart = null;
 
             return default;
         }
@@ -119,178 +144,269 @@ namespace TLRBMTASAlarmListDuration
                 };
             }
 
-            var startTimeUtc = _dateFrom.ToUniversalTime();
-            var endTimeUtc = _dateTo.ToUniversalTime();
-
-            // Parse severities from input (comma-separated) and always include Normal for OFF detection
-            var severities = _selectSeverities
-                .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
-                .Select(s => s.Trim())
-                .ToList();
-
-            // Always include Normal to detect alarm OFF events for duration calculation
-            if (!severities.Any(s => s.Equals("Normal", StringComparison.OrdinalIgnoreCase)))
+            if (_windowStart == null)
             {
-                severities.Add("Normal");
+                InitializeSearch();
+
+                if (_elementIds != null && _elementIds.Length == 0)
+                {
+                    rows.Add(CreateInfoRow($"[Info] No elements match '{_elementName}'."));
+                    return new GQIPage(rows.ToArray()) { HasNextPage = false };
+                }
+
+                // Return at once so the user sees the search is running
+                var days = (int)Math.Ceiling((_endUtc - _windowStart.Value).TotalDays);
+                var elementInfo = _elementIds == null ? "all elements" : $"{_elementIds.Length} matching elements";
+                rows.Add(CreateInfoRow($"[Info] Searching {_windowStart.Value:yyyy-MM-dd HH:mm} to {_endUtc:yyyy-MM-dd HH:mm} UTC for {elementInfo} in {Math.Max(days, 0)} daily steps. The alarm count is shown in the last row."));
+
+                return new GQIPage(rows.ToArray())
+                {
+                    HasNextPage = _windowStart.Value < _endUtc,
+                };
             }
 
-            // Create set for fast lookup (case-insensitive)
-            var severitySet = new HashSet<string>(severities, StringComparer.OrdinalIgnoreCase);
+            StartQueries();
 
-            // Apply element and parameter wildcards in the DataMiner query.
-            // Severity filtering remains in code because Normal is included to find alarm OFF events.
+            if (_pending.Count == 0)
+            {
+                return FinishSearch(rows, _nextQueryStart < _endUtc ? StopMessage(_nextQueryStart) : null);
+            }
+
+            // Never wait past the time budget, even if a single day is still running
+            var oldest = _pending.Peek();
+            var remaining = SearchTimeBudget - _searchStopwatch.Elapsed;
+            if (remaining <= TimeSpan.Zero || !oldest.Item2.Wait(remaining))
+            {
+                return FinishSearch(rows, StopMessage(oldest.Item1));
+            }
+
+            // Process in time order so ON/OFF pairing spans windows correctly
+            while (_pending.Count > 0 && _pending.Peek().Item2.IsCompleted)
+            {
+                var done = _pending.Dequeue();
+                ProcessWindow(done.Item1, done.Item2.Result, rows);
+            }
+
+            StartQueries();
+
+            if (_pending.Count == 0)
+            {
+                return FinishSearch(rows, _nextQueryStart < _endUtc ? StopMessage(_nextQueryStart) : null);
+            }
+
+            return new GQIPage(rows.ToArray())
+            {
+                HasNextPage = true,
+            };
+        }
+
+        private void StartQueries()
+        {
+            while (_pending.Count < ParallelQueries
+                && _nextQueryStart < _endUtc
+                && _searchStopwatch.Elapsed < SearchTimeBudget)
+            {
+                var start = _nextQueryStart;
+                var end = start + WindowSize;
+                if (end > _endUtc)
+                {
+                    end = _endUtc;
+                }
+
+                _pending.Enqueue(Tuple.Create(start, Task.Run(() => QueryWindow(start, end))));
+                _nextQueryStart = end;
+            }
+        }
+
+        private static string StopMessage(DateTime stoppedAt)
+        {
+            return $"[Info] Stopped early at {stoppedAt:yyyy-MM-dd HH:mm} UTC: the time limit of {SearchTimeBudget.TotalMinutes:F0} minutes was reached. Results after this time are missing; narrow the element, parameter or date range.";
+        }
+
+        private sealed class WindowResult
+        {
+            public DMSMessage[] Responses { get; set; }
+
+            public TimeSpan Elapsed { get; set; }
+        }
+
+        private WindowResult QueryWindow(DateTime windowStart, DateTime windowEnd)
+        {
+            var filterItems = new List<AlarmFilterItem>();
+            if (_elementIds != null)
+            {
+                filterItems.Add(new AlarmFilterItemString(
+                    AlarmFilterField.ElementID,
+                    AlarmFilterCompareType.Equality,
+                    _elementIds));
+            }
+
+            filterItems.Add(new AlarmFilterItemString(
+                AlarmFilterField.ParameterDescription,
+                AlarmFilterCompareType.WildcardEquality,
+                new string[] { _parameterName }));
+
             var filter = new AlarmFilter
             {
-                FilterItems = new AlarmFilterItem[]
-                {
-                    new AlarmFilterItemString(
-                        AlarmFilterField.ElementID,
-                        AlarmFilterCompareType.WildcardEquality,
-                        new string[] { _elementName }),
-                    new AlarmFilterItemString(
-                        AlarmFilterField.ParameterDescription,
-                        AlarmFilterCompareType.WildcardEquality,
-                        new string[] { _parameterName }),
-                },
+                FilterItems = filterItems.ToArray(),
             };
 
-            // Get historical alarms from DataMiner using GetAlarmDetailsFromDbMessage
             // Parameters: dmaId, filter, startTime, endTime, includeAlarmDescription, includeImpactingRecords
-            var alarmMessage = new GetAlarmDetailsFromDbMessage(
-                -1, // All DataMiner agents
-                filter,
-                startTimeUtc,
-                endTimeUtc,
-                true,
-                false);
-
-            var queryStopwatch = Stopwatch.StartNew();
+            // Descriptions are required: without them ElementName/ParameterName come back empty
+            var alarmMessage = new GetAlarmDetailsFromDbMessage(-1, filter, windowStart, windowEnd, true, false);
+            var timer = Stopwatch.StartNew();
             var responses = _dms.SendMessages(alarmMessage);
-            queryStopwatch.Stop();
+            timer.Stop();
 
-            // Precompile the parameter-name wildcard pattern once instead of per alarm
-            var parameterRegex = BuildWildcardRegex(_parameterName);
+            return new WindowResult { Responses = responses, Elapsed = timer.Elapsed };
+        }
 
-            // Collect all matching alarms and group by Root Alarm ID
-            var alarmsByRootId = new Dictionary<string, List<AlarmEventMessage>>();
-            var initialQueryAlarmCount = 0;
-
-            foreach (var response in responses)
+        private void ProcessWindow(DateTime windowStart, WindowResult result, List<GQIRow> rows)
+        {
+            _windowCount++;
+            if (result.Elapsed > _slowestWindow)
             {
-                if (response is AlarmEventMessage alarm)
+                _slowestWindow = result.Elapsed;
+                _slowestWindowStart = windowStart;
+            }
+
+            var events = new List<AlarmEventMessage>();
+            foreach (var response in result.Responses ?? new DMSMessage[0])
+            {
+                if (!(response is AlarmEventMessage alarm))
                 {
-                    initialQueryAlarmCount++;
+                    continue;
+                }
 
-                    // Filter by parameter name using wildcard matching
-                    if (!MatchesWildcard(alarm.ParameterName, parameterRegex))
-                    {
-                        continue;
-                    }
+                _returnedEventCount++;
 
-                    // Filter by severity (must be in the selected severities or Normal)
-                    if (!severitySet.Contains(alarm.Severity))
-                    {
-                        continue;
-                    }
+                if (!MatchesWildcard(alarm.ParameterName, _parameterRegex)
+                    || !_severitySet.Contains(alarm.Severity))
+                {
+                    continue;
+                }
 
-                    // Create a unique key for the root alarm tree
-                    // Using TreeID which identifies the alarm tree
-                    var rootKey = $"{alarm.DataMinerID}/{alarm.TreeID}";
-
-                    if (!alarmsByRootId.TryGetValue(rootKey, out var alarmsForRoot))
-                    {
-                        alarmsForRoot = new List<AlarmEventMessage>();
-                        alarmsByRootId[rootKey] = alarmsForRoot;
-                    }
-
-                    alarmsForRoot.Add(alarm);
+                // Adjacent windows can return the same event
+                var eventKey = $"{alarm.DataMinerID}/{alarm.AlarmID}/{alarm.TimeOfArrival.Ticks}/{alarm.Severity}";
+                if (_seenEvents.Add(eventKey))
+                {
+                    events.Add(alarm);
                 }
             }
 
-            rows.Add(new GQIRow(
-                new GQICell[]
-                {
-                    new GQICell { Value = $"Initial query returned {initialQueryAlarmCount} alarm events in {queryStopwatch.Elapsed.TotalSeconds:F2} seconds." },
-                    new GQICell { Value = string.Empty },
-                    new GQICell { Value = string.Empty },
-                    new GQICell { Value = null },
-                    new GQICell { Value = null },
-                    new GQICell { Value = null },
-                }));
+            events.Sort((a, b) => a.TimeOfArrival.CompareTo(b.TimeOfArrival));
 
-            // Process each root alarm tree to find ON/OFF pairs
-            foreach (var kvp in alarmsByRootId)
+            foreach (var alarm in events)
             {
-                // Sort alarms by TimeOfArrival in place (avoids LINQ overhead)
-                var sortedAlarms = kvp.Value;
-                sortedAlarms.Sort((a, b) => a.TimeOfArrival.CompareTo(b.TimeOfArrival));
+                var rootKey = $"{alarm.DataMinerID}/{alarm.TreeID}";
+                var isNormal = string.Equals(alarm.Severity, "Normal", StringComparison.OrdinalIgnoreCase);
 
-                // Find ON/OFF pairs
-                AlarmEventMessage currentOnAlarm = null;
-
-                foreach (var alarm in sortedAlarms)
+                if (!_openAlarms.TryGetValue(rootKey, out var onAlarm))
                 {
-                    bool isNormal = string.Equals(alarm.Severity, "Normal", StringComparison.OrdinalIgnoreCase);
-
-                    if (!isNormal && currentOnAlarm == null)
+                    if (!isNormal)
                     {
-                        // This is an Alarm ON event
-                        currentOnAlarm = alarm;
-                    }
-                    else if (isNormal && currentOnAlarm != null)
-                    {
-                        // This is an Alarm OFF event - create a row with duration
-                        var alarmOnUtc = currentOnAlarm.TimeOfArrival.ToUniversalTime();
-                        var alarmOffUtc = alarm.TimeOfArrival.ToUniversalTime();
-                        var duration = alarmOffUtc - alarmOnUtc;
-
-                        var row = new GQIRow(
-                            new GQICell[]
-                            {
-                                new GQICell { Value = currentOnAlarm.ElementName },
-                                new GQICell { Value = currentOnAlarm.ParameterName },
-                                new GQICell { Value = currentOnAlarm.Severity },
-                                new GQICell { Value = alarmOnUtc },
-                                new GQICell { Value = alarmOffUtc },
-                                new GQICell { Value = duration.TotalSeconds },
-                            });
-
-                        rows.Add(row);
-
-                        // Reset for next potential ON alarm in the same tree
-                        currentOnAlarm = null;
-                    }
-                    else if (!isNormal && currentOnAlarm != null)
-                    {
-                        // Severity changed but not to Normal (e.g., Warning -> Critical)
-                        // Keep the original ON alarm, don't create a new row yet
+                        _openAlarms[rootKey] = alarm;
                     }
                 }
-
-                // Handle case where alarm is still ON (no OFF found within the time range)
-                if (currentOnAlarm != null)
+                else if (isNormal)
                 {
-                    var alarmOnUtc = currentOnAlarm.TimeOfArrival.ToUniversalTime();
-
-                    var row = new GQIRow(
-                        new GQICell[]
-                        {
-                            new GQICell { Value = currentOnAlarm.ElementName },
-                            new GQICell { Value = currentOnAlarm.ParameterName },
-                            new GQICell { Value = currentOnAlarm.Severity },
-                            new GQICell { Value = alarmOnUtc },
-                            new GQICell { Value = null }, // Still active, no OFF time
-                            new GQICell { Value = null }, // Active alarm, duration not yet known
-                        });
-
-                    rows.Add(row);
+                    var alarmOnUtc = onAlarm.TimeOfArrival.ToUniversalTime();
+                    var alarmOffUtc = alarm.TimeOfArrival.ToUniversalTime();
+                    rows.Add(CreateRow(onAlarm, alarmOnUtc, alarmOffUtc, (alarmOffUtc - alarmOnUtc).TotalSeconds));
+                    _openAlarms.Remove(rootKey);
                 }
+            }
+        }
+
+        private GQIPage FinishSearch(List<GQIRow> rows, string stopReason)
+        {
+            // Alarms with no OFF in the searched range are still active
+            foreach (var onAlarm in _openAlarms.Values)
+            {
+                rows.Add(CreateRow(onAlarm, onAlarm.TimeOfArrival.ToUniversalTime(), null, null));
+            }
+
+            _openAlarms.Clear();
+
+            var summary = $"[Info] Query returned {_returnedEventCount} alarm events in {_searchStopwatch.Elapsed.TotalSeconds:F2} seconds over {_windowCount} daily steps ({ParallelQueries} in parallel).";
+            if (_windowCount > 0)
+            {
+                summary += $" Slowest day: {_slowestWindowStart:yyyy-MM-dd} ({_slowestWindow.TotalSeconds:F2} s).";
+            }
+
+            rows.Insert(0, CreateInfoRow(summary));
+            if (stopReason != null)
+            {
+                rows.Insert(0, CreateInfoRow(stopReason));
             }
 
             return new GQIPage(rows.ToArray())
             {
                 HasNextPage = false,
             };
+        }
+
+        private static GQIRow CreateInfoRow(string message)
+        {
+            return new GQIRow(
+                new GQICell[]
+                {
+                    new GQICell { Value = message },
+                    new GQICell { Value = string.Empty },
+                    new GQICell { Value = string.Empty },
+                    new GQICell { Value = null },
+                    new GQICell { Value = null },
+                    new GQICell { Value = null },
+                });
+        }
+
+        private void InitializeSearch()
+        {
+            _endUtc = _dateTo.ToUniversalTime();
+            _windowStart = _dateFrom.ToUniversalTime();
+            _openAlarms.Clear();
+            _seenEvents.Clear();
+            _returnedEventCount = 0;
+            _searchStopwatch.Restart();
+            _windowCount = 0;
+            _slowestWindow = TimeSpan.Zero;
+            _nextQueryStart = _windowStart.Value;
+            _pending.Clear();
+
+            // Resolve names to IDs so the database filters by element instead of scanning all alarms
+            var elementRegex = BuildWildcardRegex(_elementName);
+            _elementIds = elementRegex == null
+                ? null
+                : _dms.SendMessages(new GetInfoMessage(InfoType.ElementInfo))
+                    .OfType<ElementInfoEventMessage>()
+                    .Where(e => MatchesWildcard(e.Name, elementRegex))
+                    .Select(e => $"{e.DataMinerID}/{e.ElementID}")
+                    .Distinct()
+                    .ToArray();
+
+            // Normal is always needed to detect alarm OFF events
+            _severitySet = new HashSet<string>(
+                _selectSeverities.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries).Select(s => s.Trim()),
+                StringComparer.OrdinalIgnoreCase)
+            {
+                "Normal",
+            };
+
+            _parameterRegex = BuildWildcardRegex(_parameterName);
+        }
+
+        private static GQIRow CreateRow(AlarmEventMessage alarm, DateTime onUtc, DateTime? offUtc, double? durationSeconds)
+        {
+            return new GQIRow(
+                new GQICell[]
+                {
+                    new GQICell { Value = alarm.ElementName },
+                    new GQICell { Value = alarm.ParameterName },
+                    new GQICell { Value = alarm.Severity },
+                    new GQICell { Value = onUtc },
+                    new GQICell { Value = offUtc },
+                    new GQICell { Value = durationSeconds },
+                });
         }
 
 
